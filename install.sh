@@ -58,7 +58,7 @@ cp -r "$(dirname "$(realpath "$0")")"/* "$INSTALL_DIR/"
 
 # ── Dépendances Python ──────────────────────────────────────────────────────
 say "Installation des dépendances Python..."
-python3 -m pip install --quiet --user -r "$INSTALL_DIR/requirements.txt"
+python3 -m pip install --quiet --user --break-system-packages -r "$INSTALL_DIR/requirements.txt"
 ok "Dépendances installées."
 
 # ── Créer la commande 'msg' dans ~/bin ──────────────────────────────────────

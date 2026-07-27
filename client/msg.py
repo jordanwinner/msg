@@ -625,7 +625,8 @@ def cmd_update(args):
     req = INSTALL_DIR / "requirements.txt"
     if req.exists():
         subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
-                        "--user", "-r", str(req)], check=False)
+                        "--user", "--break-system-packages",
+                        "-r", str(req)], check=False)
 
     cprint("✓ MSG mis à jour avec succès !", "GREEN")
     cprint("  Relance ton terminal ou tape 'source ~/.zshrc' pour appliquer.", "DIM")
