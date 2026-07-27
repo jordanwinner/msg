@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """
-Serveur MSG — WebSocket + HTTP health check pour Render
+Serveur MSG — aiohttp + WebSocket
+Compatible Render.com : répond au health check HTTP et aux connexions WebSocket
+sur le même port.
 """
 import asyncio
-import websockets
-import sqlite3
 import json
 import hashlib
 import os
 import sys
 import logging
-from datetime import datetime
-from http.server import BaseHTTPRequestHandler
-import threading
+import sqlite3
+from aiohttp import web
 
 DB_PATH = os.environ.get("MSG_DB", os.path.expanduser("~/.msg_server.db"))
 PORT = int(os.environ.get("PORT", 9999))
@@ -41,7 +40,6 @@ def init_db():
             public_key TEXT NOT NULL,
             created_at TEXT DEFAULT (datetime('now'))
         );
-
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             sender TEXT NOT NULL,
@@ -61,85 +59,77 @@ def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
 
 
+# ── Health check HTTP ──────────────────────────────────────────────────────────
+
+async def handle_health(request):
+    return web.Response(text="MSG server OK\n")
+
+
 # ── Handler WebSocket ──────────────────────────────────────────────────────────
 
-async def handle_client(websocket):
+async def handle_ws(request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+
     username = None
-    log.info(f"Nouvelle connexion : {websocket.remote_address}")
+    log.info(f"Nouvelle connexion : {request.remote}")
 
     try:
-        async for raw in websocket:
-            try:
-                packet = json.loads(raw)
-            except json.JSONDecodeError:
-                await send(websocket, {"ok": False, "error": "JSON invalide"})
-                continue
+        async for msg in ws:
+            if msg.type == web.WSMsgType.TEXT:
+                try:
+                    packet = json.loads(msg.data)
+                except json.JSONDecodeError:
+                    await ws.send_json({"ok": False, "error": "JSON invalide"})
+                    continue
 
-            action = packet.get("action")
+                action = packet.get("action")
 
-            if action == "register":
-                username = await do_register(websocket, packet)
-            elif action == "login":
-                username = await do_login(websocket, packet)
-            elif action == "send":
-                await do_send(websocket, packet, username)
-            elif action == "list":
-                await do_list(websocket, username)
-            elif action == "contacts":
-                await do_contacts(websocket, username)
-            elif action == "get_pubkey":
-                await do_get_pubkey(websocket, packet, username)
-            elif action == "mark_read":
-                await do_mark_read(websocket, packet, username)
-            else:
-                await send(websocket, {"ok": False, "error": "Action inconnue"})
+                if action == "register":
+                    username = await do_register(ws, packet)
+                elif action == "login":
+                    username = await do_login(ws, packet)
+                elif action == "send":
+                    await do_send(ws, packet, username)
+                elif action == "list":
+                    await do_list(ws, username)
+                elif action == "contacts":
+                    await do_contacts(ws, username)
+                elif action == "get_pubkey":
+                    await do_get_pubkey(ws, packet, username)
+                elif action == "mark_read":
+                    await do_mark_read(ws, packet, username)
+                else:
+                    await ws.send_json({"ok": False, "error": "Action inconnue"})
 
-    except websockets.exceptions.ConnectionClosed:
-        pass
+            elif msg.type == web.WSMsgType.ERROR:
+                log.error(f"Erreur WebSocket : {ws.exception()}")
+                break
+
     except Exception as e:
-        log.error(f"Erreur : {e}")
+        log.error(f"Erreur client : {e}")
     finally:
         if username:
             log.info(f"Déconnecté : {username}")
 
-
-async def send(websocket, data: dict):
-    await websocket.send(json.dumps(data))
-
-
-# ── Health check HTTP pour Render ─────────────────────────────────────────────
-
-def health_check(connection, request):
-    """
-    Répond aux requêtes HTTP normales (health check de Render).
-    Si ce n'est pas une upgrade WebSocket, on retourne 200 OK.
-    """
-    if request.headers.get("Upgrade", "").lower() != "websocket":
-        from websockets.http11 import Response
-        from websockets.datastructures import Headers
-        return Response(
-            status_code=200,
-            reason_phrase="OK",
-            headers=Headers([("Content-Type", "text/plain"), ("Content-Length", "14")]),
-            body=b"MSG server OK\n"
-        )
+    return ws
 
 
 # ── Actions ────────────────────────────────────────────────────────────────────
 
-async def do_register(websocket, packet):
+async def do_register(ws, packet):
     username = packet.get("username", "").strip().lower()
     password = packet.get("password", "")
     public_key = packet.get("public_key", "")
 
     if not username or not password or not public_key:
-        await send(websocket, {"ok": False, "error": "Champs manquants"})
+        await ws.send_json({"ok": False, "error": "Champs manquants"})
         return None
     if len(username) < 3 or len(username) > 20:
-        await send(websocket, {"ok": False, "error": "Pseudo : 3 à 20 caractères"})
+        await ws.send_json({"ok": False, "error": "Pseudo : 3 à 20 caractères"})
         return None
     if not username.isalnum():
-        await send(websocket, {"ok": False, "error": "Pseudo : lettres et chiffres uniquement"})
+        await ws.send_json({"ok": False, "error": "Pseudo : lettres et chiffres uniquement"})
         return None
 
     db = get_db()
@@ -149,17 +139,17 @@ async def do_register(websocket, packet):
             (username, hash_password(password), public_key)
         )
         db.commit()
-        await send(websocket, {"ok": True, "msg": f"Compte créé. Bienvenue {username} ✓"})
+        await ws.send_json({"ok": True, "msg": f"Compte créé. Bienvenue {username} ✓"})
         log.info(f"Nouveau compte : {username}")
         return username
     except sqlite3.IntegrityError:
-        await send(websocket, {"ok": False, "error": "Ce pseudo est déjà pris"})
+        await ws.send_json({"ok": False, "error": "Ce pseudo est déjà pris"})
         return None
     finally:
         db.close()
 
 
-async def do_login(websocket, packet):
+async def do_login(ws, packet):
     username = packet.get("username", "").strip().lower()
     password = packet.get("password", "")
 
@@ -171,17 +161,17 @@ async def do_login(websocket, packet):
     db.close()
 
     if not row:
-        await send(websocket, {"ok": False, "error": "Identifiants incorrects"})
+        await ws.send_json({"ok": False, "error": "Identifiants incorrects"})
         return None
 
     log.info(f"Connecté : {username}")
-    await send(websocket, {"ok": True, "msg": f"Connecté en tant que {username}"})
+    await ws.send_json({"ok": True, "msg": f"Connecté en tant que {username}"})
     return username
 
 
-async def do_send(websocket, packet, username):
+async def do_send(ws, packet, username):
     if not username:
-        await send(websocket, {"ok": False, "error": "Non authentifié"})
+        await ws.send_json({"ok": False, "error": "Non authentifié"})
         return
 
     recipient = packet.get("to", "").strip().lower()
@@ -190,13 +180,13 @@ async def do_send(websocket, packet, username):
     filename = packet.get("filename")
 
     if not recipient or not content:
-        await send(websocket, {"ok": False, "error": "Destinataire ou contenu manquant"})
+        await ws.send_json({"ok": False, "error": "Destinataire ou contenu manquant"})
         return
 
     db = get_db()
     row = db.execute("SELECT username FROM users WHERE username=?", (recipient,)).fetchone()
     if not row:
-        await send(websocket, {"ok": False, "error": f"Utilisateur '{recipient}' introuvable"})
+        await ws.send_json({"ok": False, "error": f"Utilisateur '{recipient}' introuvable"})
         db.close()
         return
 
@@ -206,12 +196,12 @@ async def do_send(websocket, packet, username):
     )
     db.commit()
     db.close()
-    await send(websocket, {"ok": True, "msg": f"Message envoyé à {recipient} ✓"})
+    await ws.send_json({"ok": True, "msg": f"Message envoyé à {recipient} ✓"})
 
 
-async def do_list(websocket, username):
+async def do_list(ws, username):
     if not username:
-        await send(websocket, {"ok": False, "error": "Non authentifié"})
+        await ws.send_json({"ok": False, "error": "Non authentifié"})
         return
 
     db = get_db()
@@ -233,12 +223,12 @@ async def do_list(websocket, username):
         "date": r["created_at"]
     } for r in rows]
 
-    await send(websocket, {"ok": True, "messages": messages})
+    await ws.send_json({"ok": True, "messages": messages})
 
 
-async def do_contacts(websocket, username):
+async def do_contacts(ws, username):
     if not username:
-        await send(websocket, {"ok": False, "error": "Non authentifié"})
+        await ws.send_json({"ok": False, "error": "Non authentifié"})
         return
 
     db = get_db()
@@ -247,12 +237,12 @@ async def do_contacts(websocket, username):
     ).fetchall()
     db.close()
 
-    await send(websocket, {"ok": True, "contacts": [r["username"] for r in rows]})
+    await ws.send_json({"ok": True, "contacts": [r["username"] for r in rows]})
 
 
-async def do_get_pubkey(websocket, packet, username):
+async def do_get_pubkey(ws, packet, username):
     if not username:
-        await send(websocket, {"ok": False, "error": "Non authentifié"})
+        await ws.send_json({"ok": False, "error": "Non authentifié"})
         return
 
     target = packet.get("username", "").strip().lower()
@@ -261,15 +251,15 @@ async def do_get_pubkey(websocket, packet, username):
     db.close()
 
     if not row:
-        await send(websocket, {"ok": False, "error": f"Utilisateur '{target}' introuvable"})
+        await ws.send_json({"ok": False, "error": f"Utilisateur '{target}' introuvable"})
         return
 
-    await send(websocket, {"ok": True, "public_key": row["public_key"]})
+    await ws.send_json({"ok": True, "public_key": row["public_key"]})
 
 
-async def do_mark_read(websocket, packet, username):
+async def do_mark_read(ws, packet, username):
     if not username:
-        await send(websocket, {"ok": False, "error": "Non authentifié"})
+        await ws.send_json({"ok": False, "error": "Non authentifié"})
         return
 
     db = get_db()
@@ -280,23 +270,28 @@ async def do_mark_read(websocket, packet, username):
         db.execute("UPDATE messages SET read=1 WHERE recipient=?", (username,))
     db.commit()
     db.close()
-    await send(websocket, {"ok": True})
+    await ws.send_json({"ok": True})
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 async def main():
     init_db()
+
+    app = web.Application()
+    app.router.add_get("/", handle_health)
+    app.router.add_get("/ws", handle_ws)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+
     log.info(f"Serveur MSG démarré sur 0.0.0.0:{PORT}")
     log.info(f"Base de données : {DB_PATH}")
+    log.info(f"WebSocket : ws://0.0.0.0:{PORT}/ws")
 
-    async with websockets.serve(
-        handle_client,
-        "0.0.0.0",
-        PORT,
-        process_request=health_check
-    ):
-        await asyncio.Future()
+    await asyncio.Future()
 
 
 if __name__ == "__main__":

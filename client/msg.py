@@ -10,7 +10,7 @@ import getpass
 import configparser
 import mimetypes
 import asyncio
-import websockets
+import aiohttp
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -63,12 +63,14 @@ def is_configured() -> bool:
 def get_ws_url(cfg) -> str:
     host = cfg.get("server", "host", fallback="127.0.0.1")
     port = cfg.get("server", "port", fallback="9999")
-    # Si l'host ressemble à une URL Render (*.onrender.com), on utilise wss://
     if "onrender.com" in host or host.startswith("wss://") or host.startswith("ws://"):
-        url = host if host.startswith("ws") else f"wss://{host}"
+        base = host if host.startswith("ws") else f"wss://{host}"
     else:
-        url = f"ws://{host}:{port}"
-    return url
+        base = f"ws://{host}:{port}"
+    # Le serveur aiohttp expose le WebSocket sur /ws
+    if not base.endswith("/ws"):
+        base = base.rstrip("/") + "/ws"
+    return base
 
 
 def load_private_key():
@@ -84,17 +86,21 @@ def load_private_key():
 async def ws_call(url: str, packets: list) -> list:
     """
     Envoie une liste de paquets et retourne les réponses dans l'ordre.
-    Ferme la connexion proprement après.
     """
     responses = []
     try:
-        async with websockets.connect(url, open_timeout=10) as ws:
-            for pkt in packets:
-                await ws.send(json.dumps(pkt))
-                raw = await asyncio.wait_for(ws.recv(), timeout=15)
-                responses.append(json.loads(raw))
-    except (websockets.exceptions.WebSocketException, OSError) as e:
-        cprint(f"✗ Connexion impossible : {e}", RED)
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(url, timeout=aiohttp.ClientWSTimeout(ws_close=10)) as ws:
+                for pkt in packets:
+                    await ws.send_json(pkt)
+                    raw = await asyncio.wait_for(ws.receive(), timeout=15)
+                    if raw.type == aiohttp.WSMsgType.TEXT:
+                        responses.append(json.loads(raw.data))
+                    else:
+                        cprint(f"✗ Erreur de connexion (type={raw.type})", RED)
+                        sys.exit(1)
+    except aiohttp.ClientConnectorError as e:
+        cprint(f"✗ Impossible de se connecter au serveur : {e}", RED)
         sys.exit(1)
     except asyncio.TimeoutError:
         cprint("✗ Timeout — le serveur ne répond pas.", RED)
