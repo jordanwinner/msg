@@ -532,8 +532,6 @@ def cmd_interactive():
     cfg    = load_config()
     prompt = get_prompt(cfg)
 
-    cprint(f"\n{_C['BOLD']}── Mode MSG ──{_C['R']} (tape 'help' ou 'exit')\n", "CYAN")
-
     while True:
         try:
             line = input(f"{_C['CYAN']}{prompt}{_C['R']} ").strip()
