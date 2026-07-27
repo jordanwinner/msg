@@ -21,23 +21,31 @@ from common.crypto import (
     encrypt_file, decrypt_file
 )
 
-CONFIG_DIR = Path.home() / ".config" / "msg"
+CONFIG_DIR  = Path.home() / ".config" / "msg"
 CONFIG_FILE = CONFIG_DIR / "config.ini"
-KEY_FILE = CONFIG_DIR / "private.pem"
+KEY_FILE    = CONFIG_DIR / "private.pem"
 DOWNLOADS_DIR = Path.home() / "msg_downloads"
 
-# Couleurs
-R      = "\033[0m"
-CYAN   = "\033[96m"
-GREEN  = "\033[92m"
-RED    = "\033[91m"
-YELLOW = "\033[93m"
-BOLD   = "\033[1m"
-DIM    = "\033[2m"
+# ── Couleurs (désactivées en mode silencieux) ──────────────────────────────────
+def _colors_on():
+    return {
+        "R": "\033[0m", "CYAN": "\033[96m", "GREEN": "\033[92m",
+        "RED": "\033[91m", "YELLOW": "\033[93m", "BOLD": "\033[1m", "DIM": "\033[2m"
+    }
 
+def _colors_off():
+    return {k: "" for k in ["R","CYAN","GREEN","RED","YELLOW","BOLD","DIM"]}
 
-def cprint(text, color=R):
-    print(f"{color}{text}{R}")
+_C = _colors_on()   # couleurs actives par défaut
+
+def set_silent(on: bool):
+    global _C
+    _C = _colors_off() if on else _colors_on()
+
+def cprint(text, color="R"):
+    c = _C.get(color, "")
+    r = _C["R"]
+    print(f"{c}{text}{r}")
 
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -67,7 +75,6 @@ def get_ws_url(cfg) -> str:
         base = host if host.startswith("ws") else f"wss://{host}"
     else:
         base = f"ws://{host}:{port}"
-    # Le serveur aiohttp expose le WebSocket sur /ws
     if not base.endswith("/ws"):
         base = base.rstrip("/") + "/ws"
     return base
@@ -75,18 +82,20 @@ def get_ws_url(cfg) -> str:
 
 def load_private_key():
     if not KEY_FILE.exists():
-        cprint("✗ Clé privée introuvable. Lance 'msg setup'", RED)
+        cprint("✗ Clé privée introuvable. Lance 'msg setup'", "RED")
         sys.exit(1)
     with open(KEY_FILE, "rb") as f:
         return deserialize_private_key(f.read())
 
 
+def get_prompt(cfg) -> str:
+    """Retourne le prompt du mode interactif (personnalisable)."""
+    return cfg.get("display", "prompt", fallback="msg>")
+
+
 # ── WebSocket helper ───────────────────────────────────────────────────────────
 
 async def ws_call(url: str, packets: list) -> list:
-    """
-    Envoie une liste de paquets et retourne les réponses dans l'ordre.
-    """
     responses = []
     try:
         async with aiohttp.ClientSession() as session:
@@ -97,199 +106,49 @@ async def ws_call(url: str, packets: list) -> list:
                     if raw.type == aiohttp.WSMsgType.TEXT:
                         responses.append(json.loads(raw.data))
                     else:
-                        cprint(f"✗ Erreur de connexion (type={raw.type})", RED)
+                        cprint(f"✗ Erreur connexion", "RED")
                         sys.exit(1)
     except aiohttp.ClientConnectorError as e:
-        cprint(f"✗ Impossible de se connecter au serveur : {e}", RED)
+        cprint(f"✗ Impossible de se connecter : {e}", "RED")
         sys.exit(1)
     except asyncio.TimeoutError:
-        cprint("✗ Timeout — le serveur ne répond pas.", RED)
+        cprint("✗ Timeout — serveur injoignable.", "RED")
         sys.exit(1)
     return responses
 
 
 def call(url: str, packets: list) -> list:
-    """Version synchrone de ws_call."""
     return asyncio.run(ws_call(url, packets))
 
 
-# ── Commandes ──────────────────────────────────────────────────────────────────
-
-def cmd_setup():
-    cprint(f"\n{BOLD}── Configuration MSG ──{R}", CYAN)
-
-    cfg = configparser.ConfigParser()
-
-    print(f"\n{DIM}Adresse du serveur{R}")
-    print(f"  {DIM}• Local        : 127.0.0.1{R}")
-    print(f"  {DIM}• Tailscale    : 100.x.x.x{R}")
-    print(f"  {DIM}• Render       : mon-app.onrender.com{R}")
-    host = input(f"{CYAN}Serveur{R} : ").strip()
-    if not host:
-        host = "127.0.0.1"
-
-    # Pour local/Tailscale on demande le port, pour Render non
-    if "onrender.com" in host or host.startswith("ws"):
-        port = "443"
-    else:
-        port = input(f"{CYAN}Port{R} [9999] : ").strip() or "9999"
-
-    cfg["server"] = {"host": host, "port": port}
-
-    print(f"\n{DIM}Création de ton compte{R}")
-    username = input(f"{CYAN}Pseudo{R} (lettres/chiffres, 3-20 car.) : ").strip().lower()
-    password = getpass.getpass(f"{CYAN}Mot de passe{R} : ")
-    password2 = getpass.getpass(f"{CYAN}Confirme{R} : ")
-
-    if password != password2:
-        cprint("✗ Les mots de passe ne correspondent pas.", RED)
-        sys.exit(1)
-
-    cfg["user"] = {"username": username, "password": password}
-
-    # Génération des clés
-    cprint("\n⚙  Génération de tes clés de chiffrement...", YELLOW)
-    private_key, public_key = generate_keypair()
-    pub_pem = serialize_public_key(public_key)
-    priv_pem = serialize_private_key(private_key)
-
-    # Sauvegarder localement
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    with open(KEY_FILE, "wb") as f:
-        f.write(priv_pem)
-    os.chmod(KEY_FILE, 0o600)
-    save_config(cfg)
-
-    # Enregistrement sur le serveur
-    cprint("↑  Enregistrement sur le serveur...", YELLOW)
-    url = get_ws_url(cfg)
-    responses = call(url, [{
-        "action": "register",
-        "username": username,
-        "password": password,
-        "public_key": pub_pem
-    }])
-    resp = responses[0]
-
-    if resp.get("ok"):
-        cprint(f"\n✓ {resp['msg']}", GREEN)
-        cprint(f"  Config : {CONFIG_FILE}", DIM)
-        cprint(f"  Clé privée : {KEY_FILE}", DIM)
-    else:
-        cprint(f"\n✗ {resp.get('error', 'Erreur')}", RED)
-        sys.exit(1)
+def auth_packets(cfg) -> list:
+    return [{"action": "login",
+             "username": cfg.get("user", "username"),
+             "password": cfg.get("user", "password")}]
 
 
-def cmd_send(args):
-    if not is_configured():
-        cprint("✗ Lance d'abord 'msg setup'", RED)
-        return
-    if not args:
-        cprint(f"Usage : msg @pseudo \"message\"", YELLOW)
-        cprint(f"        msg @pseudo fichier.pdf", YELLOW)
-        return
+# ── Affichage des messages ─────────────────────────────────────────────────────
 
-    recipient = args[0].lstrip("@").lower()
-    content_arg = " ".join(args[1:]) if len(args) > 1 else None
-
-    if not content_arg:
-        cprint("Usage : msg @pseudo \"message\"", YELLOW)
-        return
-
-    cfg = load_config()
-    url = get_ws_url(cfg)
-    username = cfg.get("user", "username")
-    password = cfg.get("user", "password")
-
-    # Login + récupérer clé publique du destinataire en une session
-    responses = call(url, [
-        {"action": "login", "username": username, "password": password},
-        {"action": "get_pubkey", "username": recipient}
-    ])
-
-    if not responses[0].get("ok"):
-        cprint(f"✗ {responses[0].get('error')}", RED)
-        return
-    if not responses[1].get("ok"):
-        cprint(f"✗ {responses[1].get('error')}", RED)
-        return
-
-    recipient_pubkey = deserialize_public_key(responses[1]["public_key"])
-
-    # Fichier ou texte ?
-    file_path = Path(content_arg)
-    if file_path.exists() and file_path.is_file():
-        cprint(f"↑  Chiffrement de {file_path.name}...", YELLOW)
-        encrypted = encrypt_file(str(file_path), recipient_pubkey)
-        mime = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
-        msg_type = "image" if mime.startswith("image") else "file"
-        pkt = {
-            "action": "send", "to": recipient,
-            "content": encrypted.decode(),
-            "type": msg_type, "filename": file_path.name
-        }
-    else:
-        encrypted = encrypt_message(content_arg, recipient_pubkey)
-        pkt = {"action": "send", "to": recipient, "content": encrypted, "type": "text"}
-
-    responses2 = call(url, [
-        {"action": "login", "username": username, "password": password},
-        pkt
-    ])
-    resp = responses2[1]
-    if resp.get("ok"):
-        cprint(f"✓ {resp['msg']}", GREEN)
-    else:
-        cprint(f"✗ {resp.get('error', 'Erreur')}", RED)
-
-
-def cmd_list(args):
-    if not is_configured():
-        cprint("✗ Lance d'abord 'msg setup'", RED)
-        return
-
-    cfg = load_config()
-    url = get_ws_url(cfg)
-    username = cfg.get("user", "username")
-    password = cfg.get("user", "password")
-    private_key = load_private_key()
-
-    responses = call(url, [
-        {"action": "login", "username": username, "password": password},
-        {"action": "list"},
-        {"action": "mark_read"}
-    ])
-
-    if not responses[0].get("ok"):
-        cprint(f"✗ {responses[0].get('error')}", RED)
-        return
-
-    messages = responses[1].get("messages", [])
-    if not messages:
-        cprint("Aucun message.", DIM)
-        return
-
-    unread = [m for m in messages if not m["read"]]
-    read   = [m for m in messages if m["read"]]
-
-    if unread:
-        cprint(f"\n{BOLD}── Nouveaux messages ({len(unread)}) ──{R}", CYAN)
-        _display_messages(unread, private_key)
-    if read:
-        cprint(f"\n{DIM}── Anciens messages ({len(read)}) ──{R}", DIM)
-        _display_messages(read, private_key)
-
-
-def _display_messages(messages, private_key):
+def _display_messages(messages, private_key, show_direction=False, my_username=None):
     DOWNLOADS_DIR.mkdir(exist_ok=True)
     for m in messages:
         date   = m["date"][:16]
         sender = m["from"]
-        status = f" {GREEN}●{R}" if not m["read"] else ""
+        status = f" {_C['GREEN']}●{_C['R']}" if not m.get("read", True) else ""
+        sd_tag = f" {_C['YELLOW']}[autodestruct]{_C['R']}" if m.get("self_destruct") else ""
+
+        # Flèche pour mode conversation
+        if show_direction and my_username:
+            arrow = f"{_C['GREEN']}▶{_C['R']}" if sender == my_username else f"{_C['CYAN']}◀{_C['R']}"
+            who   = "moi" if sender == my_username else f"@{sender}"
+            header = f"  {arrow} {_C['BOLD']}{who}{_C['R']} {_C['DIM']}[{date}]{_C['R']}{sd_tag}"
+        else:
+            header = f"  {_C['CYAN']}[{date}]{_C['R']} {_C['BOLD']}@{sender}{_C['R']}{status}{sd_tag}"
+
         try:
             if m["type"] == "text":
                 content = decrypt_message(m["content"], private_key)
-                print(f"  {CYAN}[{date}]{R} {BOLD}@{sender}{R}{status}")
+                print(header)
                 print(f"  {content}\n")
             elif m["type"] in ("file", "image"):
                 filename, data = decrypt_file(m["content"].encode(), private_key)
@@ -297,19 +156,261 @@ def _display_messages(messages, private_key):
                 with open(dest, "wb") as f:
                     f.write(data)
                 icon = "🖼" if m["type"] == "image" else "📎"
-                print(f"  {CYAN}[{date}]{R} {BOLD}@{sender}{R}{status}")
-                print(f"  {icon} Fichier reçu : {GREEN}{dest}{R}\n")
+                print(header)
+                print(f"  {icon} {_C['GREEN']}{dest}{_C['R']}\n")
         except Exception:
-            print(f"  {CYAN}[{date}]{R} {BOLD}@{sender}{R} {RED}[illisible]{R}\n")
+            print(f"{header} {_C['RED']}[illisible]{_C['R']}\n")
+
+
+# ── Commandes ──────────────────────────────────────────────────────────────────
+
+def cmd_setup():
+    cprint(f"\n{_C['BOLD']}── Configuration MSG ──{_C['R']}", "CYAN")
+
+    cfg = configparser.ConfigParser()
+
+    print(f"\n{_C['DIM']}Adresse du serveur{_C['R']}")
+    print(f"  {_C['DIM']}• Local     : 127.0.0.1{_C['R']}")
+    print(f"  {_C['DIM']}• Render    : mon-app.onrender.com{_C['R']}")
+    host = input(f"{_C['CYAN']}Serveur{_C['R']} : ").strip()
+    if not host:
+        host = "127.0.0.1"
+
+    if "onrender.com" in host or host.startswith("ws"):
+        port = "443"
+    else:
+        port = input(f"{_C['CYAN']}Port{_C['R']} [9999] : ").strip() or "9999"
+
+    cfg["server"] = {"host": host, "port": port}
+
+    print(f"\n{_C['DIM']}Création de ton compte{_C['R']}")
+    username = input(f"{_C['CYAN']}Pseudo{_C['R']} (lettres/chiffres, 3-20 car.) : ").strip().lower()
+    password = getpass.getpass(f"{_C['CYAN']}Mot de passe{_C['R']} : ")
+    password2 = getpass.getpass(f"{_C['CYAN']}Confirme{_C['R']} : ")
+
+    if password != password2:
+        cprint("✗ Les mots de passe ne correspondent pas.", "RED")
+        sys.exit(1)
+
+    cfg["user"] = {"username": username, "password": password}
+
+    # Prompt personnalisable
+    print(f"\n{_C['DIM']}Prompt du mode interactif (défaut: msg>){_C['R']}")
+    prompt = input(f"{_C['CYAN']}Prompt{_C['R']} [msg>] : ").strip() or "msg>"
+    cfg["display"] = {"prompt": prompt}
+
+    cprint("\n⚙  Génération des clés...", "YELLOW")
+    private_key, public_key = generate_keypair()
+    pub_pem  = serialize_public_key(public_key)
+    priv_pem = serialize_private_key(private_key)
+
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(KEY_FILE, "wb") as f:
+        f.write(priv_pem)
+    os.chmod(KEY_FILE, 0o600)
+    save_config(cfg)
+
+    cprint("↑  Enregistrement...", "YELLOW")
+    url = get_ws_url(cfg)
+    resp = call(url, [{"action": "register", "username": username,
+                       "password": password, "public_key": pub_pem}])[0]
+
+    if resp.get("ok"):
+        cprint(f"\n✓ {resp['msg']}", "GREEN")
+        cprint(f"  Config : {CONFIG_FILE}", "DIM")
+    else:
+        cprint(f"\n✗ {resp.get('error', 'Erreur')}", "RED")
+        sys.exit(1)
+
+
+def cmd_send(args, self_destruct=False):
+    if not is_configured():
+        cprint("✗ Lance d'abord 'msg setup'", "RED"); return
+    if not args:
+        cprint(f"Usage : msg @pseudo \"message\"", "YELLOW")
+        cprint(f"        msg @pseudo fichier.pdf", "YELLOW"); return
+
+    recipient   = args[0].lstrip("@").lower()
+    content_arg = " ".join(args[1:]) if len(args) > 1 else None
+
+    if not content_arg:
+        cprint("Usage : msg @pseudo \"message\"", "YELLOW"); return
+
+    cfg      = load_config()
+    url      = get_ws_url(cfg)
+    username = cfg.get("user", "username")
+    password = cfg.get("user", "password")
+
+    responses = call(url, [
+        {"action": "login", "username": username, "password": password},
+        {"action": "get_pubkey", "username": recipient}
+    ])
+
+    if not responses[0].get("ok"):
+        cprint(f"✗ {responses[0].get('error')}", "RED"); return
+    if not responses[1].get("ok"):
+        cprint(f"✗ {responses[1].get('error')}", "RED"); return
+
+    recipient_pubkey = deserialize_public_key(responses[1]["public_key"])
+
+    file_path = Path(content_arg)
+    if file_path.exists() and file_path.is_file():
+        cprint(f"↑  Chiffrement de {file_path.name}...", "YELLOW")
+        encrypted = encrypt_file(str(file_path), recipient_pubkey)
+        mime = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+        msg_type = "image" if mime.startswith("image") else "file"
+        pkt = {"action": "send", "to": recipient, "content": encrypted.decode(),
+               "type": msg_type, "filename": file_path.name, "self_destruct": self_destruct}
+    else:
+        encrypted = encrypt_message(content_arg, recipient_pubkey)
+        pkt = {"action": "send", "to": recipient, "content": encrypted,
+               "type": "text", "self_destruct": self_destruct}
+
+    resp = call(url, [
+        {"action": "login", "username": username, "password": password},
+        pkt
+    ])[1]
+
+    if resp.get("ok"):
+        sd = f" {_C['YELLOW']}(autodestruct){_C['R']}" if self_destruct else ""
+        cprint(f"✓ {resp['msg']}{sd}", "GREEN")
+    else:
+        cprint(f"✗ {resp.get('error', 'Erreur')}", "RED")
+
+
+def cmd_list(args):
+    if not is_configured():
+        cprint("✗ Lance d'abord 'msg setup'", "RED"); return
+
+    cfg         = load_config()
+    url         = get_ws_url(cfg)
+    username    = cfg.get("user", "username")
+    password    = cfg.get("user", "password")
+    private_key = load_private_key()
+
+    responses = call(url, [
+        {"action": "login", "username": username, "password": password},
+        {"action": "list", "unread_only": False},
+        {"action": "mark_read"}
+    ])
+
+    if not responses[0].get("ok"):
+        cprint(f"✗ {responses[0].get('error')}", "RED"); return
+
+    messages = responses[1].get("messages", [])
+    if not messages:
+        cprint("Aucun message.", "DIM"); return
+
+    unread = [m for m in messages if not m["read"]]
+    read   = [m for m in messages if m["read"]]
+
+    if unread:
+        cprint(f"\n{_C['BOLD']}── Nouveaux ({len(unread)}) ──{_C['R']}", "CYAN")
+        _display_messages(unread, private_key)
+    if read:
+        cprint(f"\n{_C['DIM']}── Anciens ({len(read)}) ──{_C['R']}", "DIM")
+        _display_messages(read, private_key)
+
+
+def cmd_unread(args):
+    """Affiche uniquement les messages non lus."""
+    if not is_configured():
+        cprint("✗ Lance d'abord 'msg setup'", "RED"); return
+
+    cfg         = load_config()
+    url         = get_ws_url(cfg)
+    username    = cfg.get("user", "username")
+    password    = cfg.get("user", "password")
+    private_key = load_private_key()
+
+    responses = call(url, [
+        {"action": "login", "username": username, "password": password},
+        {"action": "unread"}
+    ])
+
+    if not responses[0].get("ok"):
+        cprint(f"✗ {responses[0].get('error')}", "RED"); return
+
+    messages = responses[1].get("messages", [])
+    count    = responses[1].get("count", 0)
+
+    if not messages:
+        cprint("Aucun nouveau message.", "DIM"); return
+
+    cprint(f"\n{_C['BOLD']}── {count} nouveau(x) message(s) ──{_C['R']}", "CYAN")
+    _display_messages(messages, private_key)
+
+    # Marquer comme lus
+    call(url, [
+        {"action": "login", "username": username, "password": password},
+        {"action": "mark_read"}
+    ])
+
+
+def cmd_conversation(args):
+    """Affiche la conversation complète avec une personne."""
+    if not is_configured():
+        cprint("✗ Lance d'abord 'msg setup'", "RED"); return
+    if not args:
+        cprint("Usage : msg conv @pseudo", "YELLOW"); return
+
+    other       = args[0].lstrip("@").lower()
+    cfg         = load_config()
+    url         = get_ws_url(cfg)
+    username    = cfg.get("user", "username")
+    password    = cfg.get("user", "password")
+    private_key = load_private_key()
+
+    responses = call(url, [
+        {"action": "login", "username": username, "password": password},
+        {"action": "conversation", "with": other}
+    ])
+
+    if not responses[0].get("ok"):
+        cprint(f"✗ {responses[0].get('error')}", "RED"); return
+
+    messages = responses[1].get("messages", [])
+    if not messages:
+        cprint(f"Aucun échange avec @{other}.", "DIM"); return
+
+    cprint(f"\n{_C['BOLD']}── Conversation avec @{other} ──{_C['R']}", "CYAN")
+    _display_messages(messages, private_key, show_direction=True, my_username=username)
+
+
+def cmd_del(args):
+    """Supprime la conversation avec une personne."""
+    if not is_configured():
+        cprint("✗ Lance d'abord 'msg setup'", "RED"); return
+    if not args:
+        cprint("Usage : msg del @pseudo", "YELLOW"); return
+
+    other    = args[0].lstrip("@").lower()
+    cfg      = load_config()
+    url      = get_ws_url(cfg)
+    username = cfg.get("user", "username")
+    password = cfg.get("user", "password")
+
+    confirm = input(f"Supprimer toute la conversation avec @{other} ? [o/N] ").strip().lower()
+    if confirm not in ("o", "oui", "y", "yes"):
+        cprint("Annulé.", "DIM"); return
+
+    resp = call(url, [
+        {"action": "login", "username": username, "password": password},
+        {"action": "del_conversation", "with": other}
+    ])[1]
+
+    if resp.get("ok"):
+        cprint(f"✓ {resp['msg']}", "GREEN")
+    else:
+        cprint(f"✗ {resp.get('error', 'Erreur')}", "RED")
 
 
 def cmd_contacts(args):
     if not is_configured():
-        cprint("✗ Lance d'abord 'msg setup'", RED)
-        return
+        cprint("✗ Lance d'abord 'msg setup'", "RED"); return
 
-    cfg = load_config()
-    url = get_ws_url(cfg)
+    cfg      = load_config()
+    url      = get_ws_url(cfg)
     username = cfg.get("user", "username")
     password = cfg.get("user", "password")
 
@@ -319,34 +420,68 @@ def cmd_contacts(args):
     ])
 
     if not responses[0].get("ok"):
-        cprint(f"✗ {responses[0].get('error')}", RED)
-        return
+        cprint(f"✗ {responses[0].get('error')}", "RED"); return
 
     contacts = responses[1].get("contacts", [])
     if not contacts:
-        cprint("Aucun contact.", DIM)
-        return
+        cprint("Aucun contact.", "DIM"); return
 
-    cprint(f"\n{BOLD}── Contacts ({len(contacts)}) ──{R}", CYAN)
+    cprint(f"\n{_C['BOLD']}── Contacts ({len(contacts)}) ──{_C['R']}", "CYAN")
     for c in contacts:
-        print(f"  @{c}")
+        status = f"{_C['GREEN']}● en ligne{_C['R']}" if c["online"] else f"{_C['DIM']}○ hors ligne{_C['R']}"
+        print(f"  @{c['username']}  {status}")
     print()
+
+
+def cmd_online(args):
+    """Vérifie si quelqu'un est en ligne."""
+    if not is_configured():
+        cprint("✗ Lance d'abord 'msg setup'", "RED"); return
+
+    cfg      = load_config()
+    url      = get_ws_url(cfg)
+    username = cfg.get("user", "username")
+    password = cfg.get("user", "password")
+
+    target = args[0].lstrip("@").lower() if args else ""
+
+    responses = call(url, [
+        {"action": "login", "username": username, "password": password},
+        {"action": "online", "username": target}
+    ])
+
+    if not responses[0].get("ok"):
+        cprint(f"✗ {responses[0].get('error')}", "RED"); return
+
+    r = responses[1]
+    if target:
+        status = f"{_C['GREEN']}en ligne ●{_C['R']}" if r.get("online") else f"{_C['DIM']}hors ligne ○{_C['R']}"
+        print(f"  @{target} : {status}")
+    else:
+        users = r.get("online_users", [])
+        if not users:
+            cprint("Personne en ligne.", "DIM")
+        else:
+            cprint(f"\n{_C['BOLD']}── En ligne ({len(users)}) ──{_C['R']}", "GREEN")
+            for u in users:
+                print(f"  @{u} {_C['GREEN']}●{_C['R']}")
+        print()
 
 
 def cmd_interactive():
     if not is_configured():
-        cprint("✗ Lance d'abord 'msg setup'", RED)
-        return
+        cprint("✗ Lance d'abord 'msg setup'", "RED"); return
 
-    cprint(f"\n{BOLD}── Mode MSG ──{R} (tape 'exit' pour quitter)\n", CYAN)
-    cprint("Commandes : list | @pseudo message | contacts | exit\n", DIM)
+    cfg    = load_config()
+    prompt = get_prompt(cfg)
+
+    cprint(f"\n{_C['BOLD']}── Mode MSG ──{_C['R']} (tape 'help' ou 'exit')\n", "CYAN")
 
     while True:
         try:
-            line = input(f"{CYAN}msg>{R} ").strip()
+            line = input(f"{_C['CYAN']}{prompt}{_C['R']} ").strip()
         except (EOFError, KeyboardInterrupt):
-            print()
-            break
+            print(); break
 
         if not line:
             continue
@@ -359,33 +494,59 @@ def cmd_interactive():
 
         if cmd == "list":
             cmd_list(rest)
+        elif cmd == "unread":
+            cmd_unread(rest)
+        elif cmd in ("conv", "conversation"):
+            cmd_conversation(rest)
+        elif cmd == "del":
+            cmd_del(rest)
         elif cmd == "contacts":
             cmd_contacts(rest)
+        elif cmd == "online":
+            cmd_online(rest)
+        elif cmd == "help":
+            cmd_help()
         elif cmd.startswith("@"):
-            cmd_send([cmd] + rest)
+            # Détecter flag autodestruct : @pseudo !texte
+            if rest and rest[0] == "!":
+                cmd_send([cmd] + rest[1:], self_destruct=True)
+            else:
+                cmd_send([cmd] + rest)
         else:
-            cprint("Commandes : list | @pseudo message | contacts | exit", DIM)
+            cprint("Commandes : list | unread | conv @pseudo | del @pseudo | @pseudo msg | contacts | online | exit", "DIM")
 
 
 def cmd_help():
+    p = _C
     print(f"""
-{BOLD}{CYAN}MSG — Messagerie chiffrée{R}
+{p['BOLD']}{p['CYAN']}MSG — Messagerie chiffrée{p['R']}
 
-{BOLD}Configuration{R}
-  msg setup                   — première configuration
+{p['BOLD']}Configuration{p['R']}
+  msg setup                        — première configuration
 
-{BOLD}Messages{R}
-  msg                         — mode interactif
-  msg list                    — voir les messages reçus
-  msg @pseudo "message"       — envoyer un message
-  msg @pseudo fichier.pdf     — envoyer un fichier
-  msg reply @pseudo "texte"   — répondre
+{p['BOLD']}Messages{p['R']}
+  msg                              — mode interactif
+  msg list                         — tous les messages reçus
+  msg unread                       — messages non lus uniquement
+  msg @pseudo "message"            — envoyer un message
+  msg @pseudo fichier.pdf          — envoyer un fichier/image
+  msg burn @pseudo "message"       — message autodestruct (supprimé après lecture)
+  msg conv @pseudo                 — conversation complète avec quelqu'un
+  msg del @pseudo                  — supprimer une conversation
 
-{BOLD}Contacts{R}
-  msg contacts                — voir les contacts
+{p['BOLD']}Contacts & statut{p['R']}
+  msg contacts                     — voir contacts + statut en ligne
+  msg online                       — qui est en ligne
+  msg online @pseudo               — voir si quelqu'un est en ligne
 
-{BOLD}Aide{R}
-  msg help                    — afficher cette aide
+{p['BOLD']}Mode interactif (prompt personnalisable){p['R']}
+  list | unread | conv @x | del @x
+  @pseudo message                  — envoyer
+  @pseudo ! message                — envoyer autodestruct
+
+{p['BOLD']}Options{p['R']}
+  msg --silent [commande]          — mode sans couleur (texte brut)
+  msg help                         — cette aide
 """)
 
 
@@ -393,6 +554,12 @@ def cmd_help():
 
 def main():
     args = sys.argv[1:]
+
+    # Mode silencieux
+    if "--silent" in args:
+        set_silent(True)
+        args = [a for a in args if a != "--silent"]
+
     if not args:
         cmd_interactive()
         return
@@ -404,8 +571,18 @@ def main():
         cmd_setup()
     elif cmd == "list":
         cmd_list(rest)
+    elif cmd == "unread":
+        cmd_unread(rest)
+    elif cmd in ("conv", "conversation"):
+        cmd_conversation(rest)
+    elif cmd == "del":
+        cmd_del(rest)
     elif cmd == "contacts":
         cmd_contacts(rest)
+    elif cmd == "online":
+        cmd_online(rest)
+    elif cmd == "burn":
+        cmd_send(rest, self_destruct=True)
     elif cmd == "reply":
         cmd_send(rest)
     elif cmd == "help":
@@ -413,7 +590,7 @@ def main():
     elif cmd.startswith("@"):
         cmd_send(args)
     else:
-        cprint(f"Commande inconnue : {cmd}. Tape 'msg help'", YELLOW)
+        cprint(f"Commande inconnue : {cmd}. Tape 'msg help'", "YELLOW")
 
 
 if __name__ == "__main__":
