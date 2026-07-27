@@ -10,6 +10,8 @@ import getpass
 import configparser
 import mimetypes
 import asyncio
+import time
+import subprocess
 import aiohttp
 from pathlib import Path
 
@@ -24,7 +26,9 @@ from common.crypto import (
 CONFIG_DIR  = Path.home() / ".config" / "msg"
 CONFIG_FILE = CONFIG_DIR / "config.ini"
 KEY_FILE    = CONFIG_DIR / "private.pem"
+LOCK_FILE   = CONFIG_DIR / "session.lock"
 DOWNLOADS_DIR = Path.home() / "msg_downloads"
+INSTALL_DIR   = Path.home() / ".local" / "lib" / "msg"
 
 # ── Couleurs (désactivées en mode silencieux) ──────────────────────────────────
 def _colors_on():
@@ -86,6 +90,59 @@ def load_private_key():
         sys.exit(1)
     with open(KEY_FILE, "rb") as f:
         return deserialize_private_key(f.read())
+
+
+# ── Verrouillage local ─────────────────────────────────────────────────────────
+
+def _session_valid() -> bool:
+    """Vérifie si la session locale est encore valide (15 min)."""
+    if not LOCK_FILE.exists():
+        return False
+    try:
+        ts = float(LOCK_FILE.read_text().strip())
+        return (time.time() - ts) < 900  # 15 minutes
+    except Exception:
+        return False
+
+
+def _refresh_session():
+    """Renouvelle le timestamp de session."""
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    LOCK_FILE.write_text(str(time.time()))
+    os.chmod(LOCK_FILE, 0o600)
+
+
+def _clear_session():
+    if LOCK_FILE.exists():
+        LOCK_FILE.unlink()
+
+
+def require_local_auth():
+    """Demande le mot de passe local si la session a expiré."""
+    if _session_valid():
+        _refresh_session()
+        return
+
+    cfg      = load_config()
+    stored   = cfg.get("user", "password", fallback=None)
+    if not stored:
+        return  # pas encore configuré
+
+    for attempt in range(3):
+        try:
+            pwd = getpass.getpass(f"{_C['CYAN']}Mot de passe MSG{_C['R']} : ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            sys.exit(0)
+
+        if pwd == stored:
+            _refresh_session()
+            return
+        else:
+            cprint(f"✗ Incorrect ({2 - attempt} essai(s) restant(s))", "RED")
+
+    cprint("✗ Trop de tentatives.", "RED")
+    sys.exit(1)
 
 
 def get_prompt(cfg) -> str:
@@ -516,6 +573,64 @@ def cmd_interactive():
             cprint("Commandes : list | unread | conv @pseudo | del @pseudo | @pseudo msg | contacts | online | exit", "DIM")
 
 
+def cmd_lock(args):
+    """Verrouille la session locale immédiatement."""
+    _clear_session()
+    cprint("✓ Session verrouillée.", "GREEN")
+
+
+def cmd_update(args):
+    """Met à jour MSG depuis GitHub."""
+    cprint(f"\n{_C['BOLD']}── Mise à jour MSG ──{_C['R']}", "CYAN")
+
+    repo_url = "https://github.com/jordanwinner/msg"
+
+    # Trouver le dossier source (là où est ce script)
+    src_dir = Path(__file__).resolve().parent.parent
+
+    # Si c'est un repo git, on pull
+    git_dir = src_dir / ".git"
+    if git_dir.exists():
+        cprint("↓  Récupération des mises à jour...", "YELLOW")
+        result = subprocess.run(["git", "-C", str(src_dir), "pull"], capture_output=True, text=True)
+        if result.returncode != 0:
+            cprint(f"✗ Erreur git pull : {result.stderr.strip()}", "RED")
+            return
+        output = result.stdout.strip()
+        if "Already up to date" in output or "Déjà à jour" in output:
+            cprint("✓ Déjà à jour.", "GREEN")
+            return
+        cprint(f"  {output}", "DIM")
+    else:
+        # Cloner dans un dossier temporaire et copier
+        import tempfile, shutil
+        cprint("↓  Téléchargement...", "YELLOW")
+        tmp = tempfile.mkdtemp()
+        result = subprocess.run(["git", "clone", "--depth=1", repo_url, tmp],
+                                capture_output=True, text=True)
+        if result.returncode != 0:
+            cprint(f"✗ Erreur : {result.stderr.strip()}", "RED")
+            return
+        for item in ["client", "server", "common", "requirements.txt", "install.sh"]:
+            src = Path(tmp) / item
+            dst = INSTALL_DIR / item
+            if src.is_dir():
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+            elif src.is_file():
+                shutil.copy2(src, dst)
+        shutil.rmtree(tmp)
+
+    # Réinstaller les dépendances
+    cprint("⚙  Mise à jour des dépendances...", "YELLOW")
+    req = INSTALL_DIR / "requirements.txt"
+    if req.exists():
+        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
+                        "--user", "-r", str(req)], check=False)
+
+    cprint("✓ MSG mis à jour avec succès !", "GREEN")
+    cprint("  Relance ton terminal ou tape 'source ~/.zshrc' pour appliquer.", "DIM")
+
+
 def cmd_help():
     p = _C
     print(f"""
@@ -523,6 +638,8 @@ def cmd_help():
 
 {p['BOLD']}Configuration{p['R']}
   msg setup                        — première configuration
+  msg update                       — mettre à jour MSG
+  msg lock                         — verrouiller la session
 
 {p['BOLD']}Messages{p['R']}
   msg                              — mode interactif
@@ -530,22 +647,22 @@ def cmd_help():
   msg unread                       — messages non lus uniquement
   msg @pseudo "message"            — envoyer un message
   msg @pseudo fichier.pdf          — envoyer un fichier/image
-  msg burn @pseudo "message"       — message autodestruct (supprimé après lecture)
-  msg conv @pseudo                 — conversation complète avec quelqu'un
+  msg burn @pseudo "message"       — message autodestruct
+  msg conv @pseudo                 — conversation complète
   msg del @pseudo                  — supprimer une conversation
 
 {p['BOLD']}Contacts & statut{p['R']}
-  msg contacts                     — voir contacts + statut en ligne
+  msg contacts                     — contacts + statut en ligne
   msg online                       — qui est en ligne
   msg online @pseudo               — voir si quelqu'un est en ligne
 
-{p['BOLD']}Mode interactif (prompt personnalisable){p['R']}
+{p['BOLD']}Mode interactif{p['R']}
   list | unread | conv @x | del @x
   @pseudo message                  — envoyer
   @pseudo ! message                — envoyer autodestruct
 
 {p['BOLD']}Options{p['R']}
-  msg --silent [commande]          — mode sans couleur (texte brut)
+  msg --silent [commande]          — mode sans couleur
   msg help                         — cette aide
 """)
 
@@ -561,15 +678,30 @@ def main():
         args = [a for a in args if a != "--silent"]
 
     if not args:
+        # Vérification auth avant mode interactif
+        if is_configured():
+            require_local_auth()
         cmd_interactive()
         return
 
     cmd  = args[0].lower()
     rest = args[1:]
 
-    if cmd == "setup":
-        cmd_setup()
-    elif cmd == "list":
+    # Ces commandes ne nécessitent pas d'auth locale
+    if cmd in ("setup", "update", "help"):
+        if cmd == "setup":
+            cmd_setup()
+        elif cmd == "update":
+            cmd_update(rest)
+        elif cmd == "help":
+            cmd_help()
+        return
+
+    # Toutes les autres commandes nécessitent l'auth locale
+    if is_configured():
+        require_local_auth()
+
+    if cmd == "list":
         cmd_list(rest)
     elif cmd == "unread":
         cmd_unread(rest)
@@ -585,8 +717,8 @@ def main():
         cmd_send(rest, self_destruct=True)
     elif cmd == "reply":
         cmd_send(rest)
-    elif cmd == "help":
-        cmd_help()
+    elif cmd == "lock":
+        cmd_lock(rest)
     elif cmd.startswith("@"):
         cmd_send(args)
     else:
