@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Serveur MSG — WebSocket
-Tourne sur Render.com (gratuit) ou en local.
+Serveur MSG — WebSocket + HTTP health check pour Render
 """
 import asyncio
 import websockets
@@ -12,6 +11,8 @@ import os
 import sys
 import logging
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler
+import threading
 
 DB_PATH = os.environ.get("MSG_DB", os.path.expanduser("~/.msg_server.db"))
 PORT = int(os.environ.get("PORT", 9999))
@@ -104,6 +105,24 @@ async def handle_client(websocket):
 
 async def send(websocket, data: dict):
     await websocket.send(json.dumps(data))
+
+
+# ── Health check HTTP pour Render ─────────────────────────────────────────────
+
+def health_check(connection, request):
+    """
+    Répond aux requêtes HTTP normales (health check de Render).
+    Si ce n'est pas une upgrade WebSocket, on retourne 200 OK.
+    """
+    if request.headers.get("Upgrade", "").lower() != "websocket":
+        from websockets.http11 import Response
+        from websockets.datastructures import Headers
+        return Response(
+            status_code=200,
+            reason_phrase="OK",
+            headers=Headers([("Content-Type", "text/plain"), ("Content-Length", "14")]),
+            body=b"MSG server OK\n"
+        )
 
 
 # ── Actions ────────────────────────────────────────────────────────────────────
@@ -271,8 +290,13 @@ async def main():
     log.info(f"Serveur MSG démarré sur 0.0.0.0:{PORT}")
     log.info(f"Base de données : {DB_PATH}")
 
-    async with websockets.serve(handle_client, "0.0.0.0", PORT):
-        await asyncio.Future()  # tourne indéfiniment
+    async with websockets.serve(
+        handle_client,
+        "0.0.0.0",
+        PORT,
+        process_request=health_check
+    ):
+        await asyncio.Future()
 
 
 if __name__ == "__main__":
